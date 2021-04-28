@@ -157,6 +157,7 @@ class SortableBlock:
     end_idx: Optional[int] = None  # half-open interval
 
     stmts: List[SortableImport] = field(default_factory=list)
+    safe_stmts: List[cst.CSTNode] = field(default_factory=list)
     imported_names: Dict[str, str] = field(default_factory=dict)
 
 
@@ -193,6 +194,13 @@ def sortable_blocks(
             cur.end_idx = i + 1
             cur.stmts.append(imp)
             cur.imported_names.update(imp.imported_names)
+        elif isinstance(stmt, (cst.ClassDef, cst.FunctionDef)) and not stmt.decorators:
+            if cur is None:
+                cur = SortableBlock(i, i + 1)
+                ret.append(cur)
+
+            cur.end_idx = i + 1
+            cur.safe_stmts.append(stmt)
         else:
             if cur:
                 cur = None
@@ -373,6 +381,32 @@ def fixup_whitespace(
     return imports
 
 
+def get_sorted_import_stmts(block: SortableBlock) -> List[cst.CSTNode]:
+    if not block.stmts:
+        return []
+
+    initial_blank, initial_comment = partition_leading_lines(
+        block.stmts[0].node.leading_lines
+    )
+    block.stmts[0].node = block.stmts[0].node.with_changes(
+        leading_lines=initial_comment
+    )
+    sorted_stmts: List[SortableImport] = fixup_whitespace(
+        initial_blank, sorted(block.stmts)
+    )
+    return [stmt.node for stmt in sorted_stmts]
+
+
+def sort_body(
+    body: Sequence[cst.CSTNode], blocks: Iterable[SortableBlock]
+) -> List[cst.CSTNode]:
+    new_body = list(body)
+    for block in blocks:
+        sorted_imports: List[cst.CSTNode] = get_sorted_import_stmts(block)
+        new_body[block.start_idx : block.end_idx] = sorted_imports + block.safe_stmts
+    return new_body
+
+
 class ImportSortingTransformer(cst.CSTTransformer):
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -381,32 +415,12 @@ class ImportSortingTransformer(cst.CSTTransformer):
         self, original_node: cst.Module, updated_node: cst.Module
     ) -> cst.Module:
         blocks = sortable_blocks(updated_node.body, config=self.config)
-        body: List[cst.CSTNode] = list(updated_node.body)
-
-        for b in blocks:
-            initial_blank, initial_comment = partition_leading_lines(
-                b.stmts[0].node.leading_lines
-            )
-            b.stmts[0].node = b.stmts[0].node.with_changes(
-                leading_lines=initial_comment
-            )
-            sorted_stmts = fixup_whitespace(initial_blank, sorted(b.stmts))
-            body[b.start_idx : b.end_idx] = [s.node for s in sorted_stmts]
+        body: List[cst.CSTNode] = sort_body(updated_node.body, blocks)
         return updated_node.with_changes(body=body)
 
     def leave_IndentedBlock(
         self, original_node: cst.IndentedBlock, updated_node: cst.IndentedBlock
     ) -> cst.IndentedBlock:
         blocks = sortable_blocks(updated_node.body, config=self.config)
-        body: List[cst.CSTNode] = list(updated_node.body)
-
-        for b in blocks:
-            initial_blank, initial_comment = partition_leading_lines(
-                b.stmts[0].node.leading_lines
-            )
-            b.stmts[0].node = b.stmts[0].node.with_changes(
-                leading_lines=initial_comment
-            )
-            sorted_stmts = fixup_whitespace(initial_blank, sorted(b.stmts))
-            body[b.start_idx : b.end_idx] = [s.node for s in sorted_stmts]
+        body: List[cst.CSTNode] = sort_body(updated_node.body, blocks)
         return updated_node.with_changes(body=body)
